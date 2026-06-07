@@ -28,19 +28,32 @@ test "privmsg without id tag falls back to the supplied id" {
   }
 }
 
+// 注: モジュール越しの variant 構築は almide codegen が未成熟なため、
+// 期待値はパターンマッチで検証する。
+
 test "ping is answered with pong" {
-  assert_eq(
-    twitch.classify_line("PING :tmi.twitch.tv", "x"),
-    twitch.Pong("PONG :tmi.twitch.tv"))
+  match twitch.classify_line("PING :tmi.twitch.tv", "x") {
+    twitch.SendPong(reply) => assert_eq(reply, "PONG :tmi.twitch.tv"),
+    _                  => assert(false),
+  }
 }
 
 test "reconnect advisory is surfaced" {
-  assert_eq(twitch.classify_line(":tmi.twitch.tv RECONNECT", "x"), twitch.Reconnect)
+  match twitch.classify_line(":tmi.twitch.tv RECONNECT", "x") {
+    twitch.Reconnect => assert(true),
+    _                => assert(false),
+  }
 }
 
 test "noise lines are ignored" {
-  assert_eq(twitch.classify_line(":tmi.twitch.tv 001 justinfan1 :Welcome", "x"), twitch.Ignore)
-  assert_eq(twitch.classify_line("", "x"), twitch.Ignore)
+  match twitch.classify_line(":tmi.twitch.tv 001 justinfan1 :Welcome", "x") {
+    twitch.Ignore => assert(true),
+    _             => assert(false),
+  }
+  match twitch.classify_line("", "x") {
+    twitch.Ignore => assert(true),
+    _             => assert(false),
+  }
 }
 
 test "tag values unescape" {

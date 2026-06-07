@@ -81,7 +81,12 @@ local fn parse_tags(s: String) -> Map[String, String] = {
     if pair != "" then {
       match string.index_of(pair, "=") {
         none    => { m[pair] = "" },
-        some(i) => { m[string.take(pair, i)] = unescape_tag_value(string.drop(pair, i + 1)) },
+        some(i) => {
+          // 注: m[式] = 式 の直書きは almide v0.25 codegen が壊れるため let を挟む。
+          let k = string.take(pair, i)
+          let unescaped = unescape_tag_value(string.drop(pair, i + 1))
+          m[k] = unescaped
+        },
       }
     }
   }
@@ -174,13 +179,13 @@ fn privmsg_to_comment(m: IrcMessage, fallback_id: String) -> Option[comment.Comm
 type LineAction =
   | Emit(comment.Comment)
   // サーバへ送り返す生 PONG 行。
-  | Pong(String)
+  | SendPong(String)
   // サーバ都合の再接続要求 — 切断して開き直す。
   | Reconnect
   | Ignore
 
 fn classify_line(line: String, fallback_id: String) -> LineAction =
-  if string.starts_with(line, "PING ") then Pong("PONG " + string.drop(line, 5))
+  if string.starts_with(line, "PING ") then SendPong("PONG " + string.drop(line, 5))
   else match parse_irc_line(line) {
     none    => Ignore,
     some(m) => match m.command {

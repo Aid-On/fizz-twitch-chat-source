@@ -20,7 +20,8 @@ effect fn main() -> Unit = {
   }
   var seq = 0
   while true {
-    seq = run_once(channel, seq)
+    // effect fn の呼び出しは Result に包まれる — 失敗時は seq を維持。
+    seq = result.unwrap_or(run_once(channel, seq), seq)
     eprintln("[twitch] disconnected; reconnecting in ${int.to_string(twitch.RECONNECT_MS)}ms")
     env.sleep_ms(twitch.RECONNECT_MS)
   }
@@ -65,7 +66,7 @@ effect fn run_once(channel: String, seq_start: Int) -> Int = {
                     seq = seq + 1
                     println(comment.comment_to_json(c))
                   },
-                  twitch.Pong(reply) => {
+                  twitch.SendPong(reply) => {
                     let _ = net.tcp_write(stream, bytes.from_string(reply + "\r\n"))
                   },
                   twitch.Reconnect => {
