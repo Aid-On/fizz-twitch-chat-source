@@ -1,0 +1,71 @@
+import self as twitch
+import fizz_protocol.comment
+
+let SAMPLE = "@badge-info=;color=#FF69B4;display-name=Viewer1;id=abc-123 :viewer1!viewer1@viewer1.tmi.twitch.tv PRIVMSG #somechannel :こんにちは！"
+
+test "privmsg with tags becomes a comment" {
+  match twitch.classify_line(SAMPLE, "tw-fallback") {
+    twitch.Emit(c) => {
+      assert_eq(c.id, "tw-abc-123")
+      assert_eq(c.user, "Viewer1")
+      assert_eq(c.text, "こんにちは！")
+      assert_eq(c.color, some("#FF69B4"))
+      assert_eq(c.source, comment.Twitch)
+    },
+    _ => assert(false),
+  }
+}
+
+test "privmsg without id tag falls back to the supplied id" {
+  let line = ":viewer1!viewer1@host PRIVMSG #ch :hi"
+  match twitch.classify_line(line, "tw-fb-1") {
+    twitch.Emit(c) => {
+      assert_eq(c.id, "tw-fb-1")
+      assert_eq(c.user, "viewer1")
+      assert_eq(c.color, none)
+    },
+    _ => assert(false),
+  }
+}
+
+test "ping is answered with pong" {
+  assert_eq(
+    twitch.classify_line("PING :tmi.twitch.tv", "x"),
+    twitch.Pong("PONG :tmi.twitch.tv"))
+}
+
+test "reconnect advisory is surfaced" {
+  assert_eq(twitch.classify_line(":tmi.twitch.tv RECONNECT", "x"), twitch.Reconnect)
+}
+
+test "noise lines are ignored" {
+  assert_eq(twitch.classify_line(":tmi.twitch.tv 001 justinfan1 :Welcome", "x"), twitch.Ignore)
+  assert_eq(twitch.classify_line("", "x"), twitch.Ignore)
+}
+
+test "tag values unescape" {
+  assert_eq(twitch.unescape_tag_value("a\\sb"), "a b")
+  assert_eq(twitch.unescape_tag_value("semi\\:colon"), "semi;colon")
+  assert_eq(twitch.unescape_tag_value("back\\\\slash"), "back\\slash")
+}
+
+test "channel names normalize" {
+  assert_eq(twitch.normalize_channel("#SomeChannel"), "somechannel")
+  assert_eq(twitch.normalize_channel("  other "), "other")
+}
+
+test "handshake requests tags before joining" {
+  let lines = twitch.handshake_lines("justinfan42", "#Ch")
+  assert_eq(list.len(lines), 3)
+  assert_eq(list.first(lines) ?? "", "CAP REQ :twitch.tv/tags twitch.tv/commands")
+  assert_eq(list.last(lines) ?? "", "JOIN #ch")
+}
+
+test "tcp buffer splits into complete lines and a remainder" {
+  let lb = twitch.split_lines("line1\r\nline2\r\npartial")
+  assert_eq(lb.complete, ["line1", "line2"])
+  assert_eq(lb.remainder, "partial")
+  let lb2 = twitch.split_lines("whole\r\n")
+  assert_eq(lb2.complete, ["whole"])
+  assert_eq(lb2.remainder, "")
+}

@@ -1,0 +1,210 @@
+// fizz_twitch_chat_source — Twitch IRC → 正規化コメント。
+//
+// 責務 (一行): Twitch チャットを匿名購読して正規化コメントを流す。
+//
+// このファイルは純粋ロジックのみ: IRC 行パース / タグ unescape /
+// PRIVMSG → Comment 正規化 / 行アクション分類。TCP 接続とループは
+// main.almd (CLI) が担う。
+//
+// プロトコル早見:
+//   - 匿名 nick `justinfan{N}` (OAuth 不要、読み取り専用)
+//   - CAP REQ :twitch.tv/tags twitch.tv/commands で display-name / color /
+//     id / RECONNECT が付く
+//   - フレーム形式: @tag1=v1;tag2=v2 :nick!user@host PRIVMSG #channel :body
+//   - 複数行が 1 つの TCP 読みに乗る。\r\n 区切り (split_lines で分解)
+//   - PING → PONG keepalive (~5 分ごと)
+//
+// 旧 openaituber は wss://irc-ws.chat.twitch.tv:443 だったが、Almide stdlib
+// の net は素 TCP のため、Twitch が公式提供する平文 IRC エンドポイント
+// irc.chat.twitch.tv:6667 を使う (匿名・読み取り専用なので平文で問題ない)。
+
+import fizz_protocol.comment
+
+let TWITCH_IRC_HOST = "irc.chat.twitch.tv"
+let TWITCH_IRC_PORT = 6667
+let RECONNECT_MS = 5000
+
+// ── ハンドシェイク ───────────────────────────────────────────────────
+
+fn normalize_channel(ch: String) -> String = {
+  let t = string.to_lower(string.trim(ch))
+  string.strip_prefix(t, "#") ?? t
+}
+
+fn handshake_lines(nick: String, channel: String) -> List[String] = [
+  "CAP REQ :twitch.tv/tags twitch.tv/commands",
+  "NICK ${nick}",
+  "JOIN #${normalize_channel(channel)}",
+]
+
+// ── IRC 行パース ─────────────────────────────────────────────────────
+
+type IrcMessage = {
+  tags: Map[String, String],
+  nick: String,
+  command: String,
+  params: List[String],
+  trailing: Option[String],
+}
+
+// Twitch タグ値のエスケープ: \s → space, \n, \r, \: → ;, \\ → \。
+fn unescape_tag_value(s: String) -> String = unescape_rec(string.chars(s), "")
+
+local fn unescape_rec(cs: List[String], acc: String) -> String =
+  match cs {
+    [] => acc,
+    _  => {
+      let h = list.first(cs) ?? ""
+      let t = list.drop(cs, 1)
+      if h == "\\" then
+        match list.first(t) {
+          none    => acc,
+          some(n) => unescape_rec(list.drop(t, 1), acc + unescape_char(n)),
+        }
+      else unescape_rec(t, acc + h)
+    },
+  }
+
+local fn unescape_char(c: String) -> String = match c {
+  "s"  => " ",
+  "n"  => "\n",
+  "r"  => "\r",
+  ":"  => ";",
+  "\\" => "\\",
+  _    => c,
+}
+
+// @key1=val1;key2=val2 形式。
+local fn parse_tags(s: String) -> Map[String, String] = {
+  var m: Map[String, String] = [:]
+  for pair in string.split(s, ";") {
+    if pair != "" then {
+      match string.index_of(pair, "=") {
+        none    => { m[pair] = "" },
+        some(i) => { m[string.take(pair, i)] = unescape_tag_value(string.drop(pair, i + 1)) },
+      }
+    }
+  }
+  m
+}
+
+type TagStep = { tags: Map[String, String], rest: String }
+
+local fn split_tags(line: String) -> Option[TagStep] =
+  if not string.starts_with(line, "@") then
+    some(TagStep { tags: parse_tags(""), rest: line })
+  else match string.index_of(line, " ") {
+    none     => none,
+    some(sp) => some(TagStep {
+      tags: parse_tags(string.slice(line, 1, sp)),
+      rest: string.drop(line, sp + 1),
+    }),
+  }
+
+type PrefixStep = { nick: String, rest: String }
+
+local fn split_prefix(s: String) -> Option[PrefixStep] =
+  if not string.starts_with(s, ":") then some(PrefixStep { nick: "", rest: s })
+  else match string.index_of(s, " ") {
+    none     => none,
+    some(sp) => {
+      let prefix = string.slice(s, 1, sp)
+      let nick = match string.index_of(prefix, "!") {
+        some(b) if b > 0 => string.take(prefix, b),
+        _                => prefix,
+      }
+      some(PrefixStep { nick: nick, rest: string.drop(s, sp + 1) })
+    },
+  }
+
+fn parse_irc_line(line: String) -> Option[IrcMessage] = {
+  guard string.trim(line) != "" else none
+  match split_tags(line) {
+    none     => none,
+    some(ts) => match split_prefix(ts.rest) {
+      none     => none,
+      some(ps) => {
+        let colon = string.index_of(ps.rest, " :")
+        let head = match colon { some(i) => string.take(ps.rest, i), none => ps.rest }
+        let trailing = match colon { some(i) => some(string.drop(ps.rest, i + 2)), none => none }
+        let parts = list.filter(string.split(string.trim(head), " "), (p) => p != "")
+        match list.first(parts) {
+          none      => none,
+          some(cmd) => some(IrcMessage {
+            tags: ts.tags,
+            nick: ps.nick,
+            command: cmd,
+            params: list.drop(parts, 1),
+            trailing: trailing,
+          }),
+        }
+      },
+    },
+  }
+}
+
+// ── PRIVMSG → Comment ────────────────────────────────────────────────
+//
+// tags の使い分け:
+//   id           → comment id (再接続をまたぐ dedupe の鍵。無ければ fallback_id)
+//   display-name → 大文字小文字つきユーザ名 (無ければ prefix の nick)
+//   color        → ユーザ設定の CSS 色
+
+fn privmsg_to_comment(m: IrcMessage, fallback_id: String) -> Option[comment.Comment] = {
+  let text = m.trailing ?? ""
+  guard text != "" else none
+  let display = m.tags["display-name"] ?? ""
+  let user = if display != "" then display
+             else if m.nick != "" then m.nick
+             else "anon"
+  let tag_id = m.tags["id"] ?? ""
+  let id = if tag_id != "" then "tw-${tag_id}" else fallback_id
+  let color_raw = m.tags["color"] ?? ""
+  some(comment.Comment {
+    id: id,
+    user: user,
+    text: text,
+    color: if color_raw == "" then none else some(color_raw),
+    source: comment.Twitch,
+  })
+}
+
+// ── 行アクション分類 (main の唯一の分岐点) ──────────────────────────
+
+type LineAction =
+  | Emit(comment.Comment)
+  // サーバへ送り返す生 PONG 行。
+  | Pong(String)
+  // サーバ都合の再接続要求 — 切断して開き直す。
+  | Reconnect
+  | Ignore
+
+fn classify_line(line: String, fallback_id: String) -> LineAction =
+  if string.starts_with(line, "PING ") then Pong("PONG " + string.drop(line, 5))
+  else match parse_irc_line(line) {
+    none    => Ignore,
+    some(m) => match m.command {
+      "PRIVMSG" => match privmsg_to_comment(m, fallback_id) {
+        some(c) => Emit(c),
+        none    => Ignore,
+      },
+      "RECONNECT" => Reconnect,
+      // NOTICE / JOIN / 001 / 353 / 366 等は黙って捨てる。
+      _ => Ignore,
+    },
+  }
+
+// ── TCP 読みバッファの行分解 ─────────────────────────────────────────
+// 複数 IRC 行が 1 読みに乗る & 行が読み境界で千切れるため、完成行と
+// 残り (次の読みに前置する) に分ける。
+
+type LineBuffer = { complete: List[String], remainder: String }
+
+fn split_lines(buffer: String) -> LineBuffer = {
+  let parts = string.split(buffer, "\r\n")
+  let n = list.len(parts)
+  LineBuffer {
+    complete: list.take(parts, n - 1),
+    remainder: list.get(parts, n - 1) ?? "",
+  }
+}

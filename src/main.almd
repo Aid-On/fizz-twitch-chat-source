@@ -1,0 +1,86 @@
+// CLI エントリポイント — 正規化コメントを NDJSON で stdout へ流す。
+// ログ・診断はすべて stderr (stdout はデータ専用)。
+//
+//   TWITCH_CHANNEL=somechannel fizz-twitch-chat-source | fizz-comment-dedupe | ...
+
+import self as twitch
+import fizz_protocol.comment
+import net
+import env
+import bytes
+import process
+
+let READ_CHUNK = 4096
+
+effect fn main() -> Unit = {
+  let channel = string.trim(env.get("TWITCH_CHANNEL") ?? "")
+  guard channel != "" else {
+    eprintln("[twitch] missing env: TWITCH_CHANNEL")
+    process.exit(1)
+  }
+  var seq = 0
+  while true {
+    seq = run_once(channel, seq)
+    eprintln("[twitch] disconnected; reconnecting in ${int.to_string(twitch.RECONNECT_MS)}ms")
+    env.sleep_ms(twitch.RECONNECT_MS)
+  }
+}
+
+// 1 接続ぶんのライフサイクル。切断 (EOF / read error / RECONNECT) で返る。
+// 戻り値は fallback id 用シーケンスの継続値。
+effect fn run_once(channel: String, seq_start: Int) -> Int = {
+  var seq = seq_start
+  // 匿名 nick。乱数の代わりに壁時計の下位桁で十分 (サーバ側に一意性要件なし)。
+  let nick = "justinfan${int.to_string(env.millis() % 1000000)}"
+  match net.tcp_connect(twitch.TWITCH_IRC_HOST, twitch.TWITCH_IRC_PORT) {
+    err(e) => {
+      eprintln("[twitch] connect error: ${e}")
+      seq
+    },
+    ok(stream) => {
+      for line in twitch.handshake_lines(nick, channel) {
+        let _ = net.tcp_write(stream, bytes.from_string(line + "\r\n"))
+      }
+      eprintln("[twitch] open — #${twitch.normalize_channel(channel)} as ${nick}")
+      var buffer = ""
+      var open = true
+      while open {
+        match net.tcp_read(stream, READ_CHUNK) {
+          err(e) => {
+            eprintln("[twitch] read error: ${e}")
+            open = false
+          },
+          ok(data) => {
+            if bytes.len(data) == 0 then {
+              // EOF — サーバ側クローズ。
+              open = false
+            } else {
+              buffer = buffer + bytes.to_string_lossy(data)
+              let lb = twitch.split_lines(buffer)
+              buffer = lb.remainder
+              for line in lb.complete {
+                let fallback = "tw-${int.to_string(env.millis())}-${int.to_string(seq)}"
+                match twitch.classify_line(line, fallback) {
+                  twitch.Emit(c) => {
+                    seq = seq + 1
+                    println(comment.comment_to_json(c))
+                  },
+                  twitch.Pong(reply) => {
+                    let _ = net.tcp_write(stream, bytes.from_string(reply + "\r\n"))
+                  },
+                  twitch.Reconnect => {
+                    eprintln("[twitch] server requested RECONNECT")
+                    open = false
+                  },
+                  twitch.Ignore => (),
+                }
+              }
+            }
+          },
+        }
+      }
+      let _ = net.tcp_close(stream)
+      seq
+    },
+  }
+}
