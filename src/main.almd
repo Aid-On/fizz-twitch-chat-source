@@ -20,8 +20,12 @@ effect fn main() -> Unit = {
   }
   var seq = 0
   while true {
-    // effect fn の呼び出しは Result に包まれる — 失敗時は seq を維持。
-    seq = result.unwrap_or(run_once(channel, seq), seq)
+    // run_once は Result[Int] を返す (effect fn は Result 返しにする — 非 Result
+    // だと呼び出し側で auto-? が挿さって build が壊れる)。失敗時は seq を維持。
+    match run_once(channel, seq) {
+      ok(s)  => { seq = s },
+      err(_) => (),
+    }
     eprintln("[twitch] disconnected; reconnecting in ${int.to_string(twitch.RECONNECT_MS)}ms")
     env.sleep_ms(twitch.RECONNECT_MS)
   }
@@ -29,14 +33,14 @@ effect fn main() -> Unit = {
 
 // 1 接続ぶんのライフサイクル。切断 (EOF / read error / RECONNECT) で返る。
 // 戻り値は fallback id 用シーケンスの継続値。
-effect fn run_once(channel: String, seq_start: Int) -> Int = {
+effect fn run_once(channel: String, seq_start: Int) -> Result[Int, String] = {
   var seq = seq_start
   // 匿名 nick。乱数の代わりに壁時計の下位桁で十分 (サーバ側に一意性要件なし)。
   let nick = "justinfan${int.to_string(env.millis() % 1000000)}"
   match net.tcp_connect(twitch.TWITCH_IRC_HOST, twitch.TWITCH_IRC_PORT) {
     err(e) => {
       eprintln("[twitch] connect error: ${e}")
-      seq
+      ok(seq)
     },
     ok(stream) => {
       for line in twitch.handshake_lines(nick, channel) {
@@ -81,7 +85,7 @@ effect fn run_once(channel: String, seq_start: Int) -> Int = {
         }
       }
       let _ = net.tcp_close(stream)
-      seq
+      ok(seq)
     },
   }
 }
